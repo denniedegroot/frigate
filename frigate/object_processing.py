@@ -12,6 +12,7 @@ import pyarrow.plasma as plasma
 import matplotlib.pyplot as plt
 from frigate.util import draw_box_with_label, PlasmaManager
 from frigate.edgetpu import load_labels
+import urllib.request
 
 PATH_TO_LABELS = '/labelmap.txt'
 
@@ -23,11 +24,12 @@ for key, val in LABELS.items():
     COLOR_MAP[val] = tuple(int(round(255 * c)) for c in cmap(key)[:3])
 
 class TrackedObjectProcessor(threading.Thread):
-    def __init__(self, config, client, topic_prefix, tracked_objects_queue):
+    def __init__(self, config, client, topic_prefix, webhook, tracked_objects_queue):
         threading.Thread.__init__(self)
         self.config = config
         self.client = client
         self.topic_prefix = topic_prefix
+        self.webhook = webhook
         self.tracked_objects_queue = tracked_objects_queue
         self.camera_data = defaultdict(lambda: {
             'best_objects': {},
@@ -38,7 +40,7 @@ class TrackedObjectProcessor(threading.Thread):
             'object_id': None
         })
         self.plasma_client = PlasmaManager()
-        
+
     def get_best(self, camera, label):
         if label in self.camera_data[camera]['best_objects']:
             return self.camera_data[camera]['best_objects'][label]['frame']
@@ -126,22 +128,34 @@ class TrackedObjectProcessor(threading.Thread):
                 new_status = 'ON' if count > 0 else 'OFF'
                 if new_status != current_object_status[obj_name]:
                     current_object_status[obj_name] = new_status
-                    self.client.publish(f"{self.topic_prefix}/{camera}/{obj_name}", new_status, retain=False)
+                    if self.client is not None:
+                        self.client.publish(f"{self.topic_prefix}/{camera}/{obj_name}", new_status, retain=False)
+                    if self.webhook is not None:
+                        urllib.request.urlopen(f"{self.webhook}/{camera}-{obj_name}?tag={new_status}")
+
                     # send the best snapshot over mqtt
                     best_frame = cv2.cvtColor(best_objects[obj_name]['frame'], cv2.COLOR_RGB2BGR)
                     ret, jpg = cv2.imencode('.jpg', best_frame)
                     if ret:
                         jpg_bytes = jpg.tobytes()
-                        self.client.publish(f"{self.topic_prefix}/{camera}/{obj_name}/snapshot", jpg_bytes, retain=True)
+                        if self.client is not None:
+                            self.client.publish(f"{self.topic_prefix}/{camera}/{obj_name}/snapshot", jpg_bytes, retain=True)
+                        if self.webhook is not None:
+                            urllib.request.urlopen(f"{self.webhook}/{camera}-{obj_name}-snapshot?tag=http://192.168.1.10:5000/{camera}/{obj_name}/best.jpg")
 
             # expire any objects that are ON and no longer detected
             expired_objects = [obj_name for obj_name, status in current_object_status.items() if status == 'ON' and not obj_name in obj_counter]
             for obj_name in expired_objects:
                 current_object_status[obj_name] = 'OFF'
-                self.client.publish(f"{self.topic_prefix}/{camera}/{obj_name}", 'OFF', retain=False)
+                if self.client is not None:
+                    self.client.publish(f"{self.topic_prefix}/{camera}/{obj_name}", 'OFF', retain=False)
+                if self.webhook is not None:
+                    urllib.request.urlopen(f"{self.webhook}/{camera}-{obj_name}?tag=OFF")
+
                 # send updated snapshot over mqtt
                 best_frame = cv2.cvtColor(best_objects[obj_name]['frame'], cv2.COLOR_RGB2BGR)
                 ret, jpg = cv2.imencode('.jpg', best_frame)
                 if ret:
                     jpg_bytes = jpg.tobytes()
-                    self.client.publish(f"{self.topic_prefix}/{camera}/{obj_name}/snapshot", jpg_bytes, retain=True)
+                    if self.client is not None:
+                        self.client.publish(f"{self.topic_prefix}/{camera}/{obj_name}/snapshot", jpg_bytes, retain=True)

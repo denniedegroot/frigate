@@ -25,14 +25,22 @@ FRIGATE_VARS = {k: v for k, v in os.environ.items() if k.startswith('FRIGATE_')}
 with open('/config/config.yml') as f:
     CONFIG = yaml.safe_load(f)
 
-MQTT_HOST = CONFIG['mqtt']['host']
-MQTT_PORT = CONFIG.get('mqtt', {}).get('port', 1883)
-MQTT_TOPIC_PREFIX = CONFIG.get('mqtt', {}).get('topic_prefix', 'frigate')
-MQTT_USER = CONFIG.get('mqtt', {}).get('user')
-MQTT_PASS = CONFIG.get('mqtt', {}).get('password')
-if not MQTT_PASS is None:
-    MQTT_PASS = MQTT_PASS.format(**FRIGATE_VARS)
-MQTT_CLIENT_ID = CONFIG.get('mqtt', {}).get('client_id', 'frigate')
+MQTT_ENABLED = CONFIG['mqtt']['enabled']
+MQTT_TOPIC_PREFIX = None
+if MQTT_ENABLED:
+    MQTT_HOST = CONFIG['mqtt']['host']
+    MQTT_PORT = CONFIG.get('mqtt', {}).get('port', 1883)
+    MQTT_TOPIC_PREFIX = CONFIG.get('mqtt', {}).get('topic_prefix', 'frigate')
+    MQTT_USER = CONFIG.get('mqtt', {}).get('user')
+    MQTT_PASS = CONFIG.get('mqtt', {}).get('password')
+    if not MQTT_PASS is None:
+        MQTT_PASS = MQTT_PASS.format(**FRIGATE_VARS)
+    MQTT_CLIENT_ID = CONFIG.get('mqtt', {}).get('client_id', 'frigate')
+
+WEBHOOK_ENABLED = CONFIG['webhook']['enabled']
+WEBHOOK_URL = None
+if WEBHOOK_ENABLED:
+    WEBHOOK_URL = CONFIG['webhook']['webhook_url']
 
 # Set the default FFmpeg config
 FFMPEG_CONFIG = CONFIG.get('ffmpeg', {})
@@ -156,13 +164,17 @@ def main():
                 print ("Unable to connect to MQTT: Connection refused. Error code: " + str(rc))
         # publish a message to signal that the service is running
         client.publish(MQTT_TOPIC_PREFIX+'/available', 'online', retain=True)
-    client = mqtt.Client(client_id=MQTT_CLIENT_ID)
-    client.on_connect = on_connect
-    client.will_set(MQTT_TOPIC_PREFIX+'/available', payload='offline', qos=1, retain=True)
-    if not MQTT_USER is None:
-        client.username_pw_set(MQTT_USER, password=MQTT_PASS)
-    client.connect(MQTT_HOST, MQTT_PORT, 60)
-    client.loop_start()
+
+    if MQTT_ENABLED:
+        client = mqtt.Client(client_id=MQTT_CLIENT_ID)
+        client.on_connect = on_connect
+        client.will_set(MQTT_TOPIC_PREFIX+'/available', payload='offline', qos=1, retain=True)
+        if not MQTT_USER is None:
+            client.username_pw_set(MQTT_USER, password=MQTT_PASS)
+        client.connect(MQTT_HOST, MQTT_PORT, 60)
+        client.loop_start()
+    else:
+        client = None
 
     plasma_process = start_plasma_store()
 
@@ -240,7 +252,7 @@ def main():
         camera_process['process'].start()
         print(f"Camera_process started for {name}: {camera_process['process'].pid}")
     
-    object_processor = TrackedObjectProcessor(CONFIG['cameras'], client, MQTT_TOPIC_PREFIX, tracked_objects_queue)
+    object_processor = TrackedObjectProcessor(CONFIG['cameras'], client, MQTT_TOPIC_PREFIX, WEBHOOK_URL, tracked_objects_queue)
     object_processor.start()
     
     camera_watchdog = CameraWatchdog(camera_processes, CONFIG['cameras'], tflite_process, tracked_objects_queue, plasma_process)
