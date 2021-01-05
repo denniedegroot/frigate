@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import datetime
 import time
 import signal
@@ -8,7 +9,8 @@ import cv2
 import threading
 import matplotlib.pyplot as plt
 import hashlib
-import pyarrow.plasma as plasma
+from multiprocessing import shared_memory
+from typing import AnyStr
 
 def draw_box_with_label(frame, x_min, y_min, x_max, y_max, label, info, thickness=2, color=None, position='ul'):
     if color is None:
@@ -43,6 +45,9 @@ def draw_box_with_label(frame, x_min, y_min, x_max, y_max, label, info, thicknes
 def calculate_region(frame_shape, xmin, ymin, xmax, ymax, multiplier=2):    
     # size is larger than longest edge
     size = int(max(xmax-xmin, ymax-ymin)*multiplier)
+    # dont go any smaller than 300
+    if size < 300:
+        size = 300
     # if the size is too big to fit in the frame
     if size > min(frame_shape[0], frame_shape[1]):
         size = min(frame_shape[0], frame_shape[1])
@@ -64,6 +69,37 @@ def calculate_region(frame_shape, xmin, ymin, xmax, ymax, multiplier=2):
         y_offset = (frame_shape[0]-size)
 
     return (x_offset, y_offset, x_offset+size, y_offset+size)
+
+def yuv_region_2_rgb(frame, region):
+    height = frame.shape[0]//3*2
+    width = frame.shape[1]
+    # make sure the size is a multiple of 4
+    size = (region[3] - region[1])//4*4
+
+    x1 = region[0] 
+    y1 = region[1]
+
+    uv_x1 = x1//2
+    uv_y1 = y1//4
+
+    uv_width = size//2
+    uv_height = size//4
+
+    u_y_start = height
+    v_y_start = height + height//4
+    two_x_offset = width//2
+
+    yuv_cropped_frame = np.zeros((size+size//2, size), np.uint8)
+    # y channel
+    yuv_cropped_frame[0:size, 0:size] = frame[y1:y1+size, x1:x1+size]
+    # u channel
+    yuv_cropped_frame[size:size+uv_height, 0:uv_width] = frame[uv_y1+u_y_start:uv_y1+u_y_start+uv_height, uv_x1:uv_x1+uv_width]
+    yuv_cropped_frame[size:size+uv_height, uv_width:size] = frame[uv_y1+u_y_start:uv_y1+u_y_start+uv_height, uv_x1+two_x_offset:uv_x1+two_x_offset+uv_width]
+    # v channel
+    yuv_cropped_frame[size+uv_height:size+uv_height*2, 0:uv_width] = frame[uv_y1+v_y_start:uv_y1+v_y_start+uv_height, uv_x1:uv_x1+uv_width]
+    yuv_cropped_frame[size+uv_height:size+uv_height*2, uv_width:size] = frame[uv_y1+v_y_start:uv_y1+v_y_start+uv_height, uv_x1+two_x_offset:uv_x1+two_x_offset+uv_width]
+
+    return cv2.cvtColor(yuv_cropped_frame, cv2.COLOR_YUV2RGB_I420)
 
 def intersection(box_a, box_b):
     return (
@@ -122,12 +158,16 @@ class EventsPerSecond:
         self._start = datetime.datetime.now().timestamp()
 
     def update(self):
+        if self._start is None:
+            self.start()
         self._timestamps.append(datetime.datetime.now().timestamp())
         # truncate the list when it goes 100 over the max_size
         if len(self._timestamps) > self._max_events+100:
             self._timestamps = self._timestamps[(1-self._max_events):]
 
     def eps(self, last_n_seconds=10):
+        if self._start is None:
+            self.start()
 		# compute the (approximate) events in the last n seconds
         now = datetime.datetime.now().timestamp()
         seconds = min(now-self._start, last_n_seconds)
@@ -139,45 +179,66 @@ def print_stack(sig, frame):
 def listen():
     signal.signal(signal.SIGUSR1, print_stack)
 
-class PlasmaManager:
-    def __init__(self):
-        self.connect()
-    
-    def connect(self):
-        while True:
-            try:
-                self.plasma_client = plasma.connect("/tmp/plasma")
-                return
-            except:
-                print(f"TrackedObjectProcessor: unable to connect plasma client")
-                time.sleep(10)
+class FrameManager(ABC):
+    @abstractmethod
+    def create(self, name, size) -> AnyStr:
+        pass
 
+    @abstractmethod
     def get(self, name, timeout_ms=0):
-        object_id = plasma.ObjectID(hashlib.sha1(str.encode(name)).digest())
-        while True:
-            try:
-                return self.plasma_client.get(object_id, timeout_ms=timeout_ms)
-            except:
-                self.connect()
-                time.sleep(1)
+        pass
 
-    def put(self, name, obj):
-        object_id = plasma.ObjectID(hashlib.sha1(str.encode(name)).digest())
-        while True:
-            try:
-                self.plasma_client.put(obj, object_id)
-                return
-            except Exception as e:
-                print(f"Failed to put in plasma: {e}")
-                self.connect()
-                time.sleep(1)
+    @abstractmethod
+    def close(self, name):
+        pass
+
+    @abstractmethod
+    def delete(self, name):
+        pass
+
+class DictFrameManager(FrameManager):
+    def __init__(self):
+        self.frames = {}
+    
+    def create(self, name, size) -> AnyStr:
+        mem = bytearray(size)
+        self.frames[name] = mem
+        return mem
+    
+    def get(self, name, shape):
+        mem = self.frames[name]
+        return np.ndarray(shape, dtype=np.uint8, buffer=mem)
+    
+    def close(self, name):
+        pass
+    
+    def delete(self, name):
+        del self.frames[name]
+
+class SharedMemoryFrameManager(FrameManager):
+    def __init__(self):
+        self.shm_store = {}
+    
+    def create(self, name, size) -> AnyStr:
+        shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+        self.shm_store[name] = shm
+        return shm.buf
+
+    def get(self, name, shape):
+        if name in self.shm_store:
+            shm = self.shm_store[name]
+        else:
+            shm = shared_memory.SharedMemory(name=name)
+            self.shm_store[name] = shm
+        return np.ndarray(shape, dtype=np.uint8, buffer=shm.buf)
+
+    def close(self, name):
+        if name in self.shm_store:
+            self.shm_store[name].close()
+            del self.shm_store[name]
 
     def delete(self, name):
-        object_id = plasma.ObjectID(hashlib.sha1(str.encode(name)).digest())
-        while True:
-            try:
-                self.plasma_client.delete([object_id])
-                return
-            except:
-                self.connect()
-                time.sleep(1)
+        if name in self.shm_store:
+            self.shm_store[name].close()
+            self.shm_store[name].unlink()
+            del self.shm_store[name]

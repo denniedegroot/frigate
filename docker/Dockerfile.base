@@ -1,0 +1,44 @@
+ARG ARCH=amd64
+FROM blakeblackshear/frigate-wheels:${ARCH} as wheels
+FROM blakeblackshear/frigate-ffmpeg:${ARCH} as ffmpeg
+
+FROM ubuntu:20.04
+LABEL maintainer "blakeb@blakeshome.com"
+
+COPY --from=ffmpeg /usr/local /usr/local/
+
+COPY --from=wheels /wheels/. /wheels/
+
+ENV FLASK_ENV=development
+ENV DEBIAN_FRONTEND=noninteractive
+# Install packages for apt repo
+RUN apt-get -qq update \
+    && apt-get upgrade -y \
+    && apt-get -qq install --no-install-recommends -y \
+    gnupg wget unzip tzdata \
+    && apt-get -qq install --no-install-recommends -y \
+        python3-pip \
+    && pip3 install -U /wheels/*.whl \
+    && APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=DontWarn apt-key adv --fetch-keys https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    && echo "deb https://packages.cloud.google.com/apt coral-edgetpu-stable main" > /etc/apt/sources.list.d/coral-edgetpu.list \
+    && echo "libedgetpu1-max libedgetpu/accepted-eula select true" | debconf-set-selections \
+    && apt-get -qq update && apt-get -qq install --no-install-recommends -y \
+        libedgetpu1-max=15.0 \
+    && rm -rf /var/lib/apt/lists/* /wheels \
+    && (apt-get autoremove -y; apt-get autoclean -y)
+
+# get model and labels
+ARG MODEL_REFS=7064b94dd5b996189242320359dbab8b52c94a84
+COPY labelmap.txt /labelmap.txt
+RUN wget -q https://github.com/google-coral/edgetpu/raw/$MODEL_REFS/test_data/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite -O /edgetpu_model.tflite
+RUN wget -q https://github.com/google-coral/edgetpu/raw/$MODEL_REFS/test_data/ssd_mobilenet_v2_coco_quant_postprocess.tflite -O /cpu_model.tflite
+
+RUN mkdir /cache /clips
+
+WORKDIR /opt/frigate/
+ADD frigate frigate/
+COPY detect_objects.py .
+COPY benchmark.py .
+COPY process_clip.py .
+
+CMD ["python3", "-u", "detect_objects.py"]
